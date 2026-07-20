@@ -1,0 +1,683 @@
+/*
+ * ============================================================================
+ * LINE FOLLOWER 2.0 - ESP32 DIGITAL SENSOR CODE (TRUE COMPETITION FINAL)
+ * ============================================================================
+ * FIXES IN THIS VERSION:
+ * [1] Digital sensor reading (no analogRead) - eliminates Bluetooth/ADC2 crash
+ * [2] Instant task execution (no 1-second ghost drive delay)
+ * [3] Correct turn directions (LEFT tag turns left, RIGHT tag turns right)
+ * [4] Spiral memory wipe (hasReversedOnce reset on REVEND)
+ * [5] Full safety wipe on every BOOT button press
+ * [6] Forward declaration of startTask() to fix compiler ordering error
+ * [7] MAX_SPEED higher than BASE_SPEED so PID can corner sharply
+ * ============================================================================
+ */
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "BluetoothSerial.h"
+BluetoothSerial SerialBT;
+// ============================================================================
+// HARDWARE PINS
+// ============================================================================
+#define NUM_SENSORS 8
+const uint8_t sensorPins[NUM_SENSORS] = {34, 35, 36, 39, 32, 33, 25, 26};
+#define PIN_PWMA 13
+#define PIN_AIN1 17
+#define PIN_AIN2 16
+#define PIN_PWMB 12
+#define PIN_BIN1 14
+#define PIN_BIN2 27
+#define OLED_SDA_PIN 21
+#define OLED_SCL_PIN 22
+#define OLED_WIDTH   128
+#define OLED_HEIGHT  64
+#define OLED_I2C_ADDR 0x3C
+#define PIN_RED    15
+#define PIN_GREEN  2
+#define PIN_BLUE   4
+#define PIN_BUZZER 3
+#define RFID_SS_PIN   5
+#define RFID_RST_PIN  -1
+#define RFID_MOSI_PIN 23
+#define RFID_MISO_PIN 19
+#define RFID_SCK_PIN  18
+#define PIN_START_BUTTON      0
+#define START_BUTTON_DEBOUNCE_MS 30
+#define CONTROL_LOOP_RATE_MS  1
+// ============================================================================
+// TUNABLE PID & SPEED PARAMETERS (Adjust via Bluetooth)
+// ============================================================================
+float   PID_KP     = 2.2f;
+float   PID_KI     = 0.0f;
+float   PID_KD     = 5.0f;
+int16_t BASE_SPEED = 170;
+#define MAX_SPEED   230   // MUST be higher than BASE_SPEED for sharp cornering!
+#define MIN_SPEED   70
+#define LINE_CENTER 3500
+#define RFID_DEBOUNCE_MS 1500
+// TASK SETTINGS
+#define TASK_SPIN_SPEED   150
+#define TASK_ROTATION_MS  1450  // Tune this with the rotation tester code
+#define RFID_TAG_ID_LEN   16
+#define RFID_TAG_BUF_SIZE 17
+// ============================================================================
+// ENUMS & STRUCTS
+// ============================================================================
+enum CommandType : uint8_t {
+  CMD_NONE = 0, CMD_SEQ, CMD_FOLLOW, CMD_BOMB, CMD_BOMBEND,
+  CMD_TONE, CMD_ROT, CMD_REVSTART, CMD_REVEND, CMD_DIS,
+  CMD_DIR_LEFT, CMD_DIR_RIGHT, CMD_TIME, CMD_STOP
+};
+enum RoverState : uint8_t {
+  ROVER_STARTUP = 0, ROVER_READY, ROVER_RUNNING, ROVER_STOPPED
+};
+typedef struct {
+  CommandType type;
+  char rawTag[17];
+  char seqPattern[9];
+  uint16_t duration;
+  uint8_t  rotations;
+  char displayText[13];
+} ParsedCommand;
+typedef struct {
+  uint16_t frequency;
+  uint16_t duration;
+} Note;
+// ============================================================================
+// HARDWARE OBJECTS
+// ============================================================================
+Adafruit_SSD1306 oledDisplay(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+MFRC522 rfidReader(RFID_SS_PIN, RFID_RST_PIN);
+// ============================================================================
+// GLOBAL VARIABLES
+// ============================================================================
+static RoverState roverState = ROVER_STARTUP;
+static uint32_t lastControlLoopTime = 0;
+// Line Sensor
+static uint16_t linePosition = LINE_CENTER;
+static uint16_t lineStrength = 0;
+// PID
+static float   pidIntegral  = 0.0f;
+static float   pidPrevError = 0.0f;
+static bool    reverseMode  = false;
+static int8_t  directionHint = 0;  // -1=Left, 0=None, 1=Right
+// RFID
+static char     lastRFIDTagUID[RFID_TAG_BUF_SIZE] = {0};
+static uint32_t lastRFIDReadTime = 0;
+// Task Flags
+static bool         isJustDisplaying    = false;
+static bool         hasReversedOnce     = false;
+static ParsedCommand pendingCommand;
+static uint32_t     commandDisplayEndTime = 0;
+static bool     rgbSequenceActive = false;
+static uint32_t seqStartTime      = 0;
+static char     rgbPattern[9]     = {0};
+static bool     bombModeActive    = false;
+static uint32_t bombStartTime     = 0;
+static uint32_t bombLastRGBToggle = 0;
+static bool     bombRGBOn         = false;
+static bool     timeHaltActive    = false;
+static uint32_t timeHaltStartTime = 0;
+static uint16_t timeHaltDuration  = 0;
+static bool     toneModeActive  = false;
+static uint32_t toneStartTime   = 0;
+static uint16_t toneDurationSec = 0;
+static uint32_t noteStartTime   = 0;
+static uint8_t  currentNoteIndex = 0;
+static bool     rotActive    = false;
+static uint32_t rotStartTime = 0;
+static uint8_t  rotCount     = 0;
+static bool     disActive    = false;
+static uint32_t disStartTime = 0;
+static char     customDisplayText[13] = {0};
+static bool stopActive = false;
+static const Note piratesTheme[] = {
+  {440,162},{523,162},{587,324},{587,324},{587,162},{659,162},
+  {698,324},{698,324},{698,162},{784,162},{659,324},{659,324},
+  {587,162},{523,162},{587,649},{0,324},
+  {440,162},{523,162},{587,324},{587,324},{587,162},{659,162},
+  {698,324},{698,324},{698,162},{784,162},{659,324},{659,324},
+  {587,162},{523,162},{440,649},{0,324}
+};
+static const uint8_t piratesThemeLength = sizeof(piratesTheme) / sizeof(piratesTheme[0]);
+// ============================================================================
+// FIX [6]: FORWARD DECLARATION
+// startTask() is called inside updateRFIDReader() which appears before it.
+// Without this line the compiler throws "not declared in this scope" error.
+// ============================================================================
+void startTask(ParsedCommand cmd);
+// ============================================================================
+// HARDWARE INIT
+// ============================================================================
+void initOLED() {
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  Wire.setClock(400000);
+  delay(100);
+  if (!oledDisplay.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
+    while (1) { delay(100); }
+  }
+  oledDisplay.clearDisplay();
+  oledDisplay.setTextColor(SSD1306_WHITE);
+  oledDisplay.setTextSize(1);
+  oledDisplay.setCursor(0, 0);
+  oledDisplay.println("LINE FOLLOWER ESP32");
+  oledDisplay.display();
+  delay(1000);
+}
+void initRFIDReader() {
+  SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, -1);
+  rfidReader.PCD_Init();
+  rfidReader.PCD_AntennaOn();
+}
+void initSensors() {
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    pinMode(sensorPins[i], INPUT);
+  }
+}
+// ============================================================================
+// LED & BUZZER
+// ============================================================================
+void setRGBColor(char c) {
+  digitalWrite(PIN_RED,   (c == 'R') ? LOW : HIGH);
+  digitalWrite(PIN_GREEN, (c == 'G') ? LOW : HIGH);
+  digitalWrite(PIN_BLUE,  (c == 'B') ? LOW : HIGH);
+}
+void setBuzzerFrequency(uint16_t freq) {
+  if (freq == 0) noTone(PIN_BUZZER);
+  else           tone(PIN_BUZZER, freq);
+}
+void stopBuzzer() { noTone(PIN_BUZZER); }
+// ============================================================================
+// MOTOR CONTROL
+// ============================================================================
+void setMotorSpeed(int16_t speedA, int16_t speedB) {
+  // reverseMode flips both motors so the robot drives backwards
+  // but still follows the PID correctly
+  if (reverseMode) {
+    speedA = -speedA;
+    speedB = -speedB;
+  }
+  if (speedA > 0) {
+    digitalWrite(PIN_AIN1, HIGH); digitalWrite(PIN_AIN2, LOW);
+    analogWrite(PIN_PWMA, speedA);
+  } else if (speedA < 0) {
+    digitalWrite(PIN_AIN1, LOW);  digitalWrite(PIN_AIN2, HIGH);
+    analogWrite(PIN_PWMA, -speedA);
+  } else {
+    digitalWrite(PIN_AIN1, LOW);  digitalWrite(PIN_AIN2, LOW);
+    analogWrite(PIN_PWMA, 0);
+  }
+  if (speedB > 0) {
+    digitalWrite(PIN_BIN1, HIGH); digitalWrite(PIN_BIN2, LOW);
+    analogWrite(PIN_PWMB, speedB);
+  } else if (speedB < 0) {
+    digitalWrite(PIN_BIN1, LOW);  digitalWrite(PIN_BIN2, HIGH);
+    analogWrite(PIN_PWMB, -speedB);
+  } else {
+    digitalWrite(PIN_BIN1, LOW);  digitalWrite(PIN_BIN2, LOW);
+    analogWrite(PIN_PWMB, 0);
+  }
+}
+void stopMotors() { setMotorSpeed(0, 0); }
+// ============================================================================
+// OLED DISPLAY
+// ============================================================================
+void displayMessage(const char* line1) {
+  oledDisplay.clearDisplay();
+  oledDisplay.setTextSize(2);
+  oledDisplay.setCursor(0, 0);
+  oledDisplay.println(line1);
+  oledDisplay.display();
+}
+void displayMessage2(const char* line1, const char* line2) {
+  oledDisplay.clearDisplay();
+  oledDisplay.setTextSize(1);
+  oledDisplay.setCursor(0, 0);
+  oledDisplay.println(line1);
+  oledDisplay.setTextSize(2);
+  oledDisplay.setCursor(0, 16);
+  oledDisplay.println(line2);
+  oledDisplay.display();
+}
+void displayLineStatus() {
+  static uint32_t lastUpdate = 0;
+  if (millis() - lastUpdate < 100) return;
+  lastUpdate = millis();
+  oledDisplay.clearDisplay();
+  oledDisplay.setTextSize(2);
+  oledDisplay.setCursor(0, 0);
+  oledDisplay.print("P:"); oledDisplay.print(linePosition);
+  oledDisplay.setCursor(0, 32);
+  oledDisplay.print("S:"); oledDisplay.print(lineStrength);
+  oledDisplay.display();
+}
+// ============================================================================
+// BLUETOOTH TUNING
+// Accepts: "P:2.5", "D:5.0", "S:170" (with colon or space separator)
+// ============================================================================
+void checkBluetooth() {
+  static String   btBuffer     = "";
+  static uint32_t lastCharTime = 0;
+  bool readyToProcess = false;
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+    lastCharTime = millis();
+    if (c == '\n' || c == '\r') {
+      if (btBuffer.length() > 0) readyToProcess = true;
+    } else {
+      btBuffer += c;
+    }
+  }
+  // Auto-flush if phone app doesn't send newline
+  if (btBuffer.length() > 0 && (millis() - lastCharTime > 200)) {
+    readyToProcess = true;
+  }
+  if (readyToProcess) {
+    btBuffer.toUpperCase();
+    if      (btBuffer.startsWith("P:") || btBuffer.startsWith("P ")) PID_KP     = btBuffer.substring(2).toFloat();
+    else if (btBuffer.startsWith("D:") || btBuffer.startsWith("D ")) PID_KD     = btBuffer.substring(2).toFloat();
+    else if (btBuffer.startsWith("S:") || btBuffer.startsWith("S ")) BASE_SPEED = btBuffer.substring(2).toInt();
+    SerialBT.print("ACK: ["); SerialBT.print(btBuffer); SerialBT.print("] -> ");
+    SerialBT.print("Kp:"); SerialBT.print(PID_KP);
+    SerialBT.print(" Kd:"); SerialBT.print(PID_KD);
+    SerialBT.print(" SPD:"); SerialBT.println(BASE_SPEED);
+    btBuffer = "";
+  }
+}
+// ============================================================================
+// RFID TAG PARSING (UID-based, fast, no block read needed)
+// To find a card's UID: open Serial Monitor and scan it, it prints the UID.
+// ============================================================================
+ParsedCommand parseRFIDTag(const char* tagUID) {
+  ParsedCommand cmd = {CMD_NONE, {0}, {0}, 0, 0, {0}};
+  if (!tagUID || tagUID[0] == '\0') return cmd;
+  if      (strcmp(tagUID, "499D75B7") == 0) { cmd.type = CMD_SEQ;      strncpy(cmd.seqPattern, "RGBOBGRO", 8); strncpy(cmd.rawTag, "SEQ:RGB",   16); }
+  else if (strcmp(tagUID, "39024AB7") == 0) { cmd.type = CMD_FOLLOW;                                          strncpy(cmd.rawTag, "FOLLOW",    16); }
+  else if (strcmp(tagUID, "19D731B7") == 0) { cmd.type = CMD_BOMB;                                            strncpy(cmd.rawTag, "BOMB",      16); }
+  else if (strcmp(tagUID, "49F183B7") == 0) { cmd.type = CMD_BOMBEND;                                         strncpy(cmd.rawTag, "BOMBEND",   16); }
+  else if (strcmp(tagUID, "39DF28B7") == 0) { cmd.type = CMD_TIME;     cmd.duration  = 8;                     strncpy(cmd.rawTag, "TIME:08",   16); }
+  else if (strcmp(tagUID, "39C620B7") == 0) { cmd.type = CMD_TONE;     cmd.duration  = 12;                    strncpy(cmd.rawTag, "TONE:12",   16); }
+  else if (strcmp(tagUID, "39B59BB7") == 0) { cmd.type = CMD_ROT;      cmd.rotations = 3;                     strncpy(cmd.rawTag, "ROT:3",     16); }
+  else if (strcmp(tagUID, "39381FB7") == 0) { cmd.type = CMD_REVSTART;                                        strncpy(cmd.rawTag, "REVSTART",  16); }
+  else if (strcmp(tagUID, "396E46B7") == 0) { cmd.type = CMD_REVEND;                                          strncpy(cmd.rawTag, "REVEND",    16); }
+  else if (strcmp(tagUID, "39490FB7") == 0) { cmd.type = CMD_DIS;      strncpy(cmd.displayText, "HOPE", 12);  strncpy(cmd.rawTag, "DIS:HOPE",  16); }
+  else if (strcmp(tagUID, "296CECB7") == 0) { cmd.type = CMD_DIR_LEFT;                                        strncpy(cmd.rawTag, "DIR:LEFT",  16); }
+  else if (strcmp(tagUID, "29BADFB7") == 0) { cmd.type = CMD_DIR_RIGHT;                                       strncpy(cmd.rawTag, "DIR:RIGHT", 16); }
+  else if (strcmp(tagUID, "B9314907") == 0) { cmd.type = CMD_STOP;                                            strncpy(cmd.rawTag, "STOP",      16); }
+  return cmd;
+}
+void updateRFIDReader() {
+  if (!rfidReader.PICC_IsNewCardPresent()) return;
+  if (!rfidReader.PICC_ReadCardSerial())  return;
+  char tagUID[RFID_TAG_BUF_SIZE] = {0};
+  char hexBuf[3] = {0};
+  for (uint8_t i = 0; i < rfidReader.uid.size && i < 4; i++) {
+    snprintf(hexBuf, sizeof(hexBuf), "%02X", rfidReader.uid.uidByte[i]);
+    strcat(tagUID, hexBuf);
+  }
+  // Prints scanned UID to Serial Monitor so you can verify/update UIDs
+  Serial.print("SCANNED UID: ");
+  Serial.println(tagUID);
+  uint32_t now = millis();
+  bool isNewTag    = (strcmp(tagUID, lastRFIDTagUID) != 0);
+  bool isDebounced = ((now - lastRFIDReadTime) > RFID_DEBOUNCE_MS);
+  if (!isNewTag && !isDebounced) {
+    rfidReader.PICC_HaltA();
+    return;
+  }
+  strncpy(lastRFIDTagUID, tagUID, RFID_TAG_ID_LEN);
+  lastRFIDReadTime = now;
+  ParsedCommand cmd = parseRFIDTag(tagUID);
+  // FIX [2]: ALL tasks execute INSTANTLY. OLED shows "SCANNED" for 1 sec in background.
+  if (cmd.type != CMD_NONE) {
+    startTask(cmd);
+    pendingCommand       = cmd;
+    commandDisplayEndTime = millis() + 1000;
+    isJustDisplaying     = true;
+  }
+  rfidReader.PICC_HaltA();
+}
+// ============================================================================
+// TASK STATE MACHINE ENGINE
+// ============================================================================
+void startTask(ParsedCommand cmd) {
+  switch (cmd.type) {
+    case CMD_SEQ:
+      rgbSequenceActive = true;
+      bombModeActive    = false;
+      strncpy(rgbPattern, cmd.seqPattern, 8);
+      seqStartTime = millis();
+      break;
+    case CMD_BOMB:
+      bombModeActive    = true;
+      rgbSequenceActive = false;
+      toneModeActive    = false;
+      bombStartTime     = millis();
+      break;
+    case CMD_BOMBEND:
+      bombModeActive = false;
+      stopBuzzer();
+      setRGBColor('O');
+      break;
+    case CMD_TIME:
+      timeHaltActive    = true;
+      timeHaltDuration  = cmd.duration;
+      timeHaltStartTime = millis();
+      break;
+    case CMD_TONE:
+      toneModeActive  = true;
+      bombModeActive  = false;
+      toneDurationSec = cmd.duration;
+      toneStartTime   = millis();
+      currentNoteIndex = 0;
+      noteStartTime   = millis();
+      break;
+    case CMD_ROT:
+      rotActive    = true;
+      rotStartTime = millis();
+      rotCount     = cmd.rotations;
+      break;
+    case CMD_REVSTART:
+      // FIX [4]: Guard prevents double-triggering on the same spiral
+      if (!hasReversedOnce) {
+        reverseMode     = true;
+        hasReversedOnce = true;
+      }
+      break;
+    case CMD_REVEND:
+      reverseMode     = false;
+      hasReversedOnce = false;  // FIX [4]: Wipe so second spiral works!
+      break;
+    case CMD_DIS:
+      disActive    = true;
+      disStartTime = millis();
+      strncpy(customDisplayText, cmd.displayText, 12);
+      break;
+    case CMD_DIR_LEFT:
+      directionHint = -1;
+      break;
+    case CMD_DIR_RIGHT:
+      directionHint = 1;
+      break;
+    case CMD_FOLLOW:
+      directionHint = 0;  // Instantly clear turn memory
+      break;
+    case CMD_STOP:
+      stopActive = true;
+      break;
+    default:
+      break;
+  }
+}
+// ============================================================================
+// BACKGROUND TASK PROCESSOR (RGB, Buzzer, OLED - all non-blocking)
+// ============================================================================
+void processBackgroundTasks() {
+  // --- LED ---
+  if (bombModeActive) {
+    if (millis() - bombLastRGBToggle > 100) {
+      bombLastRGBToggle = millis();
+      bombRGBOn = !bombRGBOn;
+      setRGBColor(bombRGBOn ? 'R' : 'O');
+    }
+  } else if (rgbSequenceActive) {
+    uint32_t seqElapsed = millis() - seqStartTime;
+    if (seqElapsed > 8000) {
+      rgbSequenceActive = false;
+      setRGBColor('O');
+    } else {
+      uint16_t durationMs; uint32_t loopStart;
+      if      (seqElapsed < 3200) { durationMs = 400; loopStart = 0;    }
+      else if (seqElapsed < 5600) { durationMs = 300; loopStart = 3200; }
+      else if (seqElapsed < 7200) { durationMs = 200; loopStart = 5600; }
+      else                        { durationMs = 100; loopStart = 7200; }
+      uint8_t colorIndex = ((seqElapsed - loopStart) / durationMs) % 8;
+      setRGBColor(rgbPattern[colorIndex]);
+    }
+  } else {
+    setRGBColor('O');
+  }
+  // --- BUZZER ---
+  if (bombModeActive) {
+    uint32_t timeInBombCycle = (millis() - bombStartTime) % 3000;
+    uint32_t beepPeriod = (timeInBombCycle > 2000) ? 100 : ((timeInBombCycle > 1000) ? 250 : 500);
+    if ((timeInBombCycle % beepPeriod) < (beepPeriod / 2)) setBuzzerFrequency(1500);
+    else stopBuzzer();
+  } else if (toneModeActive) {
+    if (millis() - toneStartTime > (uint32_t)toneDurationSec * 1000) {
+      toneModeActive = false;
+      stopBuzzer();
+    } else {
+      if (millis() - noteStartTime > piratesTheme[currentNoteIndex].duration) {
+        currentNoteIndex = (currentNoteIndex + 1) % piratesThemeLength;
+        noteStartTime = millis();
+      }
+      setBuzzerFrequency(piratesTheme[currentNoteIndex].frequency);
+    }
+  } else {
+    stopBuzzer();
+  }
+  // --- OLED (Priority hierarchy) ---
+  if (isJustDisplaying) {
+    displayMessage2("SCANNED:", pendingCommand.rawTag);
+  } else if (timeHaltActive) {
+    char buf[16];
+    sprintf(buf, "%lus / %us", (unsigned long)((millis() - timeHaltStartTime) / 1000), timeHaltDuration);
+    displayMessage2("HALT:", buf);
+  } else if (bombModeActive) {
+    char buf[16];
+    sprintf(buf, "BOMB: %lu", (unsigned long)(3 - (((millis() - bombStartTime) % 3000) / 1000)));
+    displayMessage(buf);
+  } else if (rgbSequenceActive) {
+    uint32_t seqElapsed = millis() - seqStartTime;
+    char buf[16];
+    sprintf(buf, "%lus left", (unsigned long)((seqElapsed >= 8000) ? 0 : ((8000 - seqElapsed) / 1000) + 1));
+    displayMessage2("SEQ:", buf);
+  } else if (toneModeActive) {
+    char buf[16];
+    sprintf(buf, "%lus / %us", (unsigned long)((millis() - toneStartTime) / 1000), toneDurationSec);
+    displayMessage2("TONE:", buf);
+  } else if (disActive) {
+    uint32_t disElapsed = millis() - disStartTime;
+    if (disElapsed > 5000) {
+      disActive = false;
+    } else {
+      char buf[16];
+      sprintf(buf, "%lu sec left", (unsigned long)(5 - (disElapsed / 1000)));
+      displayMessage2(customDisplayText, buf);
+    }
+  } else {
+    displayLineStatus();
+  }
+}
+// ============================================================================
+// FIX [1]: DIGITAL SENSOR PROCESSING
+// Uses digitalRead() instead of analogRead(). Pins 25/26 are ADC2 which
+// crashes when Bluetooth is active. Digital reading works perfectly on all pins.
+// White line = LOW signal on sensor output.
+// ============================================================================
+void calculateLinePosition() {
+  uint32_t weightedSum = 0;
+  uint32_t sensorSum   = 0;
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    bool seesLine = (digitalRead(sensorPins[i]) == LOW);  // LOW = on white line
+    if (seesLine) {
+      // Center sensors (3 & 4) get 3x weight to hold center line stronger
+      uint16_t val = (i == 3 || i == 4) ? 3000 : 1000;
+      weightedSum += (uint32_t)val * (i * 1000);
+      sensorSum   += val;
+    }
+  }
+  if (sensorSum > 0) {
+    linePosition = (uint16_t)(weightedSum / sensorSum);
+    lineStrength = sensorSum;
+  } else {
+    linePosition = LINE_CENTER;
+    lineStrength = 0;
+  }
+}
+// ============================================================================
+// PID CONTROL & STEERING
+// ============================================================================
+void updateLineFollowing() {
+  static uint32_t timeLostLine  = 0;
+  static bool     isLost        = false;
+  static bool     executingTurn = false;
+  // With 8 digital sensors all on (max val 3000 each = 24000 total),
+  // a junction (T or cross) reads >8000 reliably.
+  bool isJunction = (lineStrength > 8000);
+  // --- 1. Junction turn execution ---
+  if (isJunction && directionHint != 0) {
+    executingTurn = true;
+    // FIX [3]: Correct motor directions for each turn
+    if (directionHint == -1) setMotorSpeed(-150, 150);  // Hard spin LEFT
+    else                     setMotorSpeed( 150,-150);  // Hard spin RIGHT
+    return;
+  }
+  // Auto-clear turn memory once we exit junction and re-centre
+  if (executingTurn && !isJunction &&
+      abs((int32_t)linePosition - (int32_t)LINE_CENTER) < 1500) {
+    directionHint = 0;
+    executingTurn = false;
+  }
+  // --- 2. Lost line handling (covers dashed track sections too) ---
+  if (lineStrength == 0) {
+    if (!isLost) {
+      isLost       = true;
+      timeLostLine = millis();
+    }
+    if      (directionHint == -1)       setMotorSpeed(-150, 150);   // Sweep Left
+    else if (directionHint ==  1)       setMotorSpeed( 150,-150);   // Sweep Right
+    else if (pidPrevError  < -1000)     setMotorSpeed(-150, 150);   // Was left, sweep left
+    else if (pidPrevError  >  1000)     setMotorSpeed( 150,-150);   // Was right, sweep right
+    else                                setMotorSpeed( 120, 120);   // Coast straight (dashes)
+    return;
+  } else {
+    if (isLost) {
+      isLost        = false;
+      directionHint = 0;  // Clear hint once line is re-acquired
+    }
+  }
+  // --- 3. Standard PID math ---
+  int32_t error = (int32_t)linePosition - (int32_t)LINE_CENTER;
+  pidIntegral += error;
+  pidIntegral  = constrain(pidIntegral, -100000.0f, 100000.0f);
+  float pTerm      = PID_KP * error;
+  float iTerm      = PID_KI * pidIntegral;
+  float dTerm      = PID_KD * (error - pidPrevError);
+  float correction = pTerm + iTerm + dTerm;
+  float pidOutput  = constrain(correction, -200.0f, 200.0f);
+  pidPrevError     = (float)error;
+  // Dynamic speed: slow down on tight curves
+  int16_t dynamicSpeed = BASE_SPEED - (abs(error) / 40);
+  dynamicSpeed = constrain(dynamicSpeed, MIN_SPEED, MAX_SPEED);
+  // In reverse mode, flip correction direction
+  if (reverseMode) pidOutput = -pidOutput;
+  // FIX [7]: MAX_SPEED > BASE_SPEED so outer wheel can accelerate into corners
+  int16_t motorA = constrain(dynamicSpeed + (int16_t)pidOutput, -MAX_SPEED, MAX_SPEED);
+  int16_t motorB = constrain(dynamicSpeed - (int16_t)pidOutput, -MAX_SPEED, MAX_SPEED);
+  setMotorSpeed(motorA, motorB);
+}
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("Herbie_Rover");
+  pinMode(PIN_RED,    OUTPUT);
+  pinMode(PIN_GREEN,  OUTPUT);
+  pinMode(PIN_BLUE,   OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_AIN1, OUTPUT); pinMode(PIN_AIN2, OUTPUT);
+  pinMode(PIN_BIN1, OUTPUT); pinMode(PIN_BIN2, OUTPUT);
+  pinMode(PIN_PWMA, OUTPUT); pinMode(PIN_PWMB, OUTPUT);
+  pinMode(PIN_START_BUTTON, INPUT_PULLUP);
+  initSensors();
+  initOLED();
+  initRFIDReader();
+  stopMotors();
+  setRGBColor('O');
+  stopBuzzer();
+  roverState = ROVER_READY;  // No calibration needed with digital sensors
+}
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
+  uint32_t now = millis();
+  if (now - lastControlLoopTime < CONTROL_LOOP_RATE_MS) {
+    delayMicroseconds(100);
+    return;
+  }
+  lastControlLoopTime = now;
+  checkBluetooth();
+  updateRFIDReader();
+  calculateLinePosition();
+  switch (roverState) {
+    case ROVER_READY: {
+      static bool readyMsgShown = false;
+      if (!readyMsgShown) {
+        displayMessage2("Ready!", "Press BOOT Button");
+        readyMsgShown = true;
+      }
+      if (digitalRead(PIN_START_BUTTON) == LOW) {
+        delay(START_BUTTON_DEBOUNCE_MS);
+        if (digitalRead(PIN_START_BUTTON) == LOW) {
+          roverState = ROVER_RUNNING;
+          // FIX [5]: Full safety memory wipe on every single start press
+          hasReversedOnce   = false;
+          reverseMode       = false;
+          directionHint     = 0;
+          bombModeActive    = false;
+          rgbSequenceActive = false;
+          timeHaltActive    = false;
+          toneModeActive    = false;
+          rotActive         = false;
+          disActive         = false;
+          stopActive        = false;
+          isJustDisplaying  = false;
+          pidIntegral       = 0.0f;
+          pidPrevError      = 0.0f;
+        }
+      }
+      break;
+    }
+    case ROVER_RUNNING: {
+      // Clear OLED display banner after 1 second
+      if (isJustDisplaying && millis() >= commandDisplayEndTime) {
+        isJustDisplaying = false;
+      }
+      bool motorsLocked = false;
+      if (stopActive) {
+        stopMotors();
+        motorsLocked = true;
+      } else if (timeHaltActive) {
+        stopMotors();
+        if (millis() - timeHaltStartTime >= (uint32_t)timeHaltDuration * 1000) {
+          timeHaltActive = false;
+        }
+        motorsLocked = true;
+      } else if (rotActive) {
+        uint32_t totalSpinTime = (uint32_t)rotCount * TASK_ROTATION_MS;
+        if (millis() - rotStartTime < totalSpinTime) {
+          setMotorSpeed(TASK_SPIN_SPEED, -TASK_SPIN_SPEED);
+        } else {
+          rotActive = false;
+        }
+        motorsLocked = true;
+      }
+      if (!motorsLocked) updateLineFollowing();
+      processBackgroundTasks();
+      break;
+    }
+    case ROVER_STOPPED:
+      stopMotors();
+      break;
+    default:
+      break;
+  }
+}
